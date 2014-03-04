@@ -193,3 +193,4 @@ x86/intel-mid
 x86/mpx
 x86/efi-kexec
 x86/nuke-platforms
+x86/efi-mixed
