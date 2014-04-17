@@ -26,6 +26,7 @@
 #include <linux/export.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
+#include <linux/of.h>
 
 #include <video/omapdss.h>
 #include "dss.h"
@@ -41,12 +42,14 @@ static struct {
 	int datapairs;
 
 	struct omap_dss_device output;
+
+	bool port_initialized;
 } sdi;
 
 struct sdi_clk_calc_ctx {
 	unsigned long pck_min, pck_max;
 
-	struct dss_clock_info dss_cinfo;
+	unsigned long fck;
 	struct dispc_clock_info dispc_cinfo;
 };
 
@@ -63,19 +66,18 @@ static bool dpi_calc_dispc_cb(int lckd, int pckd, unsigned long lck,
 	return true;
 }
 
-static bool dpi_calc_dss_cb(int fckd, unsigned long fck, void *data)
+static bool dpi_calc_dss_cb(unsigned long fck, void *data)
 {
 	struct sdi_clk_calc_ctx *ctx = data;
 
-	ctx->dss_cinfo.fck = fck;
-	ctx->dss_cinfo.fck_div = fckd;
+	ctx->fck = fck;
 
 	return dispc_div_calc(fck, ctx->pck_min, ctx->pck_max,
 			dpi_calc_dispc_cb, ctx);
 }
 
 static int sdi_calc_clock_div(unsigned long pclk,
-		struct dss_clock_info *dss_cinfo,
+		unsigned long *fck,
 		struct dispc_clock_info *dispc_cinfo)
 {
 	int i;
@@ -98,9 +100,9 @@ static int sdi_calc_clock_div(unsigned long pclk,
 			ctx.pck_min = 0;
 		ctx.pck_max = pclk + 1000 * i * i * i;
 
-		ok = dss_div_calc(ctx.pck_min, dpi_calc_dss_cb, &ctx);
+		ok = dss_div_calc(pclk, ctx.pck_min, dpi_calc_dss_cb, &ctx);
 		if (ok) {
-			*dss_cinfo = ctx.dss_cinfo;
+			*fck = ctx.fck;
 			*dispc_cinfo = ctx.dispc_cinfo;
 			return 0;
 		}
@@ -124,11 +126,11 @@ static void sdi_config_lcd_manager(struct omap_dss_device *dssdev)
 	dss_mgr_set_lcd_config(mgr, &sdi.mgr_config);
 }
 
-int omapdss_sdi_display_enable(struct omap_dss_device *dssdev)
+static int sdi_display_enable(struct omap_dss_device *dssdev)
 {
 	struct omap_dss_device *out = &sdi.output;
 	struct omap_video_timings *t = &sdi.timings;
-	struct dss_clock_info dss_cinfo;
+	unsigned long fck;
 	struct dispc_clock_info dispc_cinfo;
 	unsigned long pck;
 	int r;
@@ -150,26 +152,25 @@ int omapdss_sdi_display_enable(struct omap_dss_device *dssdev)
 	t->data_pclk_edge = OMAPDSS_DRIVE_SIG_RISING_EDGE;
 	t->sync_pclk_edge = OMAPDSS_DRIVE_SIG_RISING_EDGE;
 
-	r = sdi_calc_clock_div(t->pixel_clock * 1000, &dss_cinfo, &dispc_cinfo);
+	r = sdi_calc_clock_div(t->pixelclock, &fck, &dispc_cinfo);
 	if (r)
 		goto err_calc_clock_div;
 
 	sdi.mgr_config.clock_info = dispc_cinfo;
 
-	pck = dss_cinfo.fck / dispc_cinfo.lck_div / dispc_cinfo.pck_div / 1000;
+	pck = fck / dispc_cinfo.lck_div / dispc_cinfo.pck_div;
 
-	if (pck != t->pixel_clock) {
-		DSSWARN("Could not find exact pixel clock. Requested %d kHz, "
-				"got %lu kHz\n",
-				t->pixel_clock, pck);
+	if (pck != t->pixelclock) {
+		DSSWARN("Could not find exact pixel clock. Requested %d Hz, got %lu Hz\n",
+			t->pixelclock, pck);
 
-		t->pixel_clock = pck;
+		t->pixelclock = pck;
 	}
 
 
 	dss_mgr_set_timings(out->manager, t);
 
-	r = dss_set_clock_div(&dss_cinfo);
+	r = dss_set_fck_rate(fck);
 	if (r)
 		goto err_set_dss_clock_div;
 
@@ -211,9 +212,8 @@ err_get_dispc:
 err_reg_enable:
 	return r;
 }
-EXPORT_SYMBOL(omapdss_sdi_display_enable);
 
-void omapdss_sdi_display_disable(struct omap_dss_device *dssdev)
+static void sdi_display_disable(struct omap_dss_device *dssdev)
 {
 	struct omap_overlay_manager *mgr = sdi.output.manager;
 
@@ -225,14 +225,12 @@ void omapdss_sdi_display_disable(struct omap_dss_device *dssdev)
 
 	regulator_disable(sdi.vdds_sdi_reg);
 }
-EXPORT_SYMBOL(omapdss_sdi_display_disable);
 
-void omapdss_sdi_set_timings(struct omap_dss_device *dssdev,
+static void sdi_set_timings(struct omap_dss_device *dssdev,
 		struct omap_video_timings *timings)
 {
 	sdi.timings = *timings;
 }
-EXPORT_SYMBOL(omapdss_sdi_set_timings);
 
 static void sdi_get_timings(struct omap_dss_device *dssdev,
 		struct omap_video_timings *timings)
@@ -248,17 +246,16 @@ static int sdi_check_timings(struct omap_dss_device *dssdev,
 	if (mgr && !dispc_mgr_timings_ok(mgr->id, timings))
 		return -EINVAL;
 
-	if (timings->pixel_clock == 0)
+	if (timings->pixelclock == 0)
 		return -EINVAL;
 
 	return 0;
 }
 
-void omapdss_sdi_set_datapairs(struct omap_dss_device *dssdev, int datapairs)
+static void sdi_set_datapairs(struct omap_dss_device *dssdev, int datapairs)
 {
 	sdi.datapairs = datapairs;
 }
-EXPORT_SYMBOL(omapdss_sdi_set_datapairs);
 
 static int sdi_init_regulator(void)
 {
@@ -267,88 +264,14 @@ static int sdi_init_regulator(void)
 	if (sdi.vdds_sdi_reg)
 		return 0;
 
-	vdds_sdi = dss_get_vdds_sdi();
-
+	vdds_sdi = devm_regulator_get(&sdi.pdev->dev, "vdds_sdi");
 	if (IS_ERR(vdds_sdi)) {
-		vdds_sdi = devm_regulator_get(&sdi.pdev->dev, "vdds_sdi");
-		if (IS_ERR(vdds_sdi)) {
+		if (PTR_ERR(vdds_sdi) != -EPROBE_DEFER)
 			DSSERR("can't get VDDS_SDI regulator\n");
-			return PTR_ERR(vdds_sdi);
-		}
+		return PTR_ERR(vdds_sdi);
 	}
 
 	sdi.vdds_sdi_reg = vdds_sdi;
-
-	return 0;
-}
-
-static struct omap_dss_device *sdi_find_dssdev(struct platform_device *pdev)
-{
-	struct omap_dss_board_info *pdata = pdev->dev.platform_data;
-	const char *def_disp_name = omapdss_get_default_display_name();
-	struct omap_dss_device *def_dssdev;
-	int i;
-
-	def_dssdev = NULL;
-
-	for (i = 0; i < pdata->num_devices; ++i) {
-		struct omap_dss_device *dssdev = pdata->devices[i];
-
-		if (dssdev->type != OMAP_DISPLAY_TYPE_SDI)
-			continue;
-
-		if (def_dssdev == NULL)
-			def_dssdev = dssdev;
-
-		if (def_disp_name != NULL &&
-				strcmp(dssdev->name, def_disp_name) == 0) {
-			def_dssdev = dssdev;
-			break;
-		}
-	}
-
-	return def_dssdev;
-}
-
-static int sdi_probe_pdata(struct platform_device *sdidev)
-{
-	struct omap_dss_device *plat_dssdev;
-	struct omap_dss_device *dssdev;
-	int r;
-
-	plat_dssdev = sdi_find_dssdev(sdidev);
-
-	if (!plat_dssdev)
-		return 0;
-
-	dssdev = dss_alloc_and_init_device(&sdidev->dev);
-	if (!dssdev)
-		return -ENOMEM;
-
-	dss_copy_device_pdata(dssdev, plat_dssdev);
-
-	r = sdi_init_regulator();
-	if (r) {
-		DSSERR("device %s init failed: %d\n", dssdev->name, r);
-		dss_put_device(dssdev);
-		return r;
-	}
-
-	r = omapdss_output_set_device(&sdi.output, dssdev);
-	if (r) {
-		DSSERR("failed to connect output to new device: %s\n",
-				dssdev->name);
-		dss_put_device(dssdev);
-		return r;
-	}
-
-	r = dss_add_device(dssdev);
-	if (r) {
-		DSSERR("device %s register failed: %d\n", dssdev->name, r);
-		omapdss_output_unset_device(&sdi.output);
-		dss_put_device(dssdev);
-		return r;
-	}
 
 	return 0;
 }
@@ -385,9 +308,9 @@ static int sdi_connect(struct omap_dss_device *dssdev,
 static void sdi_disconnect(struct omap_dss_device *dssdev,
 		struct omap_dss_device *dst)
 {
-	WARN_ON(dst != dssdev->device);
+	WARN_ON(dst != dssdev->dst);
 
-	if (dst != dssdev->device)
+	if (dst != dssdev->dst)
 		return;
 
 	omapdss_output_unset_device(dssdev);
@@ -400,14 +323,14 @@ static const struct omapdss_sdi_ops sdi_ops = {
 	.connect = sdi_connect,
 	.disconnect = sdi_disconnect,
 
-	.enable = omapdss_sdi_display_enable,
-	.disable = omapdss_sdi_display_disable,
+	.enable = sdi_display_enable,
+	.disable = sdi_display_disable,
 
 	.check_timings = sdi_check_timings,
-	.set_timings = omapdss_sdi_set_timings,
+	.set_timings = sdi_set_timings,
 	.get_timings = sdi_get_timings,
 
-	.set_datapairs = omapdss_sdi_set_datapairs,
+	.set_datapairs = sdi_set_datapairs,
 };
 
 static void sdi_init_output(struct platform_device *pdev)
@@ -434,29 +357,15 @@ static void __exit sdi_uninit_output(struct platform_device *pdev)
 
 static int omap_sdi_probe(struct platform_device *pdev)
 {
-	int r;
-
 	sdi.pdev = pdev;
 
 	sdi_init_output(pdev);
 
-	if (pdev->dev.platform_data) {
-		r = sdi_probe_pdata(pdev);
-		if (r)
-			goto err_probe;
-	}
-
 	return 0;
-
-err_probe:
-	sdi_uninit_output(pdev);
-	return r;
 }
 
 static int __exit omap_sdi_remove(struct platform_device *pdev)
 {
-	dss_unregister_child_devices(&pdev->dev);
-
 	sdi_uninit_output(pdev);
 
 	return 0;
@@ -479,4 +388,46 @@ int __init sdi_init_platform_driver(void)
 void __exit sdi_uninit_platform_driver(void)
 {
 	platform_driver_unregister(&omap_sdi_driver);
+}
+
+int __init sdi_init_port(struct platform_device *pdev, struct device_node *port)
+{
+	struct device_node *ep;
+	u32 datapairs;
+	int r;
+
+	ep = omapdss_of_get_next_endpoint(port, NULL);
+	if (!ep)
+		return 0;
+
+	r = of_property_read_u32(ep, "datapairs", &datapairs);
+	if (r) {
+		DSSERR("failed to parse datapairs\n");
+		goto err_datapairs;
+	}
+
+	sdi.datapairs = datapairs;
+
+	of_node_put(ep);
+
+	sdi.pdev = pdev;
+
+	sdi_init_output(pdev);
+
+	sdi.port_initialized = true;
+
+	return 0;
+
+err_datapairs:
+	of_node_put(ep);
+
+	return r;
+}
+
+void __exit sdi_uninit_port(void)
+{
+	if (!sdi.port_initialized)
+		return;
+
+	sdi_uninit_output(sdi.pdev);
 }

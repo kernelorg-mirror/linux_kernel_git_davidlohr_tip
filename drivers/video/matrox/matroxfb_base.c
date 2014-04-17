@@ -1773,7 +1773,8 @@ static int initMatrox2(struct matrox_fb_info *minfo, struct board *b)
 				      FBINFO_HWACCEL_FILLRECT |  /* And fillrect */
 				      FBINFO_HWACCEL_IMAGEBLIT | /* And imageblit */
 				      FBINFO_HWACCEL_XPAN |      /* And we support both horizontal */
-				      FBINFO_HWACCEL_YPAN;       /* And vertical panning */
+				      FBINFO_HWACCEL_YPAN |      /* And vertical panning */
+				      FBINFO_READS_FAST;
 	minfo->video.len_usable &= PAGE_MASK;
 	fb_alloc_cmap(&minfo->fbcon.cmap, 256, 1);
 
@@ -1893,14 +1894,12 @@ static int initMatrox2(struct matrox_fb_info *minfo, struct board *b)
 	if (register_framebuffer(&minfo->fbcon) < 0) {
 		goto failVideoIO;
 	}
-	printk("fb%d: %s frame buffer device\n",
-	       minfo->fbcon.node, minfo->fbcon.fix.id);
+	fb_info(&minfo->fbcon, "%s frame buffer device\n", minfo->fbcon.fix.id);
 
 	/* there is no console on this fb... but we have to initialize hardware
 	 * until someone tells me what is proper thing to do */
 	if (!minfo->initialized) {
-		printk(KERN_INFO "fb%d: initializing hardware\n",
-		       minfo->fbcon.node);
+		fb_info(&minfo->fbcon, "initializing hardware\n");
 		/* We have to use FB_ACTIVATE_FORCE, as we had to put vesafb_defined to the fbcon.var
 		 * already before, so register_framebuffer works correctly. */
 		vesafb_defined.activate |= FB_ACTIVATE_FORCE;
@@ -2029,10 +2028,9 @@ static int matroxfb_probe(struct pci_dev* pdev, const struct pci_device_id* dumm
 		return -1;
 	}
 
-	minfo = kmalloc(sizeof(*minfo), GFP_KERNEL);
+	minfo = kzalloc(sizeof(*minfo), GFP_KERNEL);
 	if (!minfo)
 		return -1;
-	memset(minfo, 0, sizeof(*minfo));
 
 	minfo->pcidev = pdev;
 	minfo->dead = 0;

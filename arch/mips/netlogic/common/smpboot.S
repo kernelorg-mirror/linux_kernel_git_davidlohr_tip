@@ -32,7 +32,6 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <linux/init.h>
 
 #include <asm/asm.h>
 #include <asm/asm-offsets.h>
@@ -70,7 +69,6 @@ FEXPORT(xlp_boot_core0_siblings)	/* "Master" cpu starts from here */
 	nop
 	/* not reached */
 
-	__CPUINIT
 NESTED(nlm_boot_secondary_cpus, 16, sp)
 	/* Initialize CP0 Status */
 	move	t1, zero
@@ -94,15 +92,13 @@ NESTED(nlm_boot_secondary_cpus, 16, sp)
 	jr	t0
 	nop
 END(nlm_boot_secondary_cpus)
-	__FINIT
 
 /*
  * In case of RMIboot bootloader which is used on XLR boards, the CPUs
  * be already woken up and waiting in bootloader code.
  * This will get them out of the bootloader code and into linux. Needed
- *  because the bootloader area will be taken and initialized by linux.
+ * because the bootloader area will be taken and initialized by linux.
  */
-	__CPUINIT
 NESTED(nlm_rmiboot_preboot, 16, sp)
 	mfc0	t0, $15, 1	/* read ebase */
 	andi	t0, 0x1f	/* t0 has the processor_id() */
@@ -136,8 +132,8 @@ NESTED(nlm_rmiboot_preboot, 16, sp)
 	or	t1, t2, v1	/* put in new value */
 	mtcr	t1, t0		/* update core control */
 
+	/* wait for NMI to hit */
 1:	wait
 	b	1b
 	nop
 END(nlm_rmiboot_preboot)
-	__FINIT

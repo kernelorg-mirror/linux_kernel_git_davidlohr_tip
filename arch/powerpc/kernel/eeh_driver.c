@@ -146,7 +146,28 @@ static void eeh_enable_irq(struct pci_dev *dev)
 
 	if ((edev->mode) & EEH_DEV_IRQ_DISABLED) {
 		edev->mode &= ~EEH_DEV_IRQ_DISABLED;
-		enable_irq(dev->irq);
+		/*
+		 * FIXME !!!!!
+		 *
+		 * This is just ass backwards. This maze has
+		 * unbalanced irq_enable/disable calls. So instead of
+		 * finding the root cause it works around the warning
+		 * in the irq_enable code by conditionally calling
+		 * into it.
+		 *
+		 * That's just wrong.The warning in the core code is
+		 * there to tell people to fix their assymetries in
+		 * their own code, not by abusing the core information
+		 * to avoid it.
+		 *
+		 * I so wish that the assymetry would be the other way
+		 * round and a few more irq_disable calls render that
+		 * shit unusable forever.
+		 *
+		 *	tglx
+		 */
+		if (irqd_irq_disabled(irq_get_irq_data(dev->irq)))
+			enable_irq(dev->irq);
 	}
 }
 
@@ -213,7 +234,8 @@ static void *eeh_report_mmio_enabled(void *data, void *userdata)
 	if (!driver) return NULL;
 
 	if (!driver->err_handler ||
-	    !driver->err_handler->mmio_enabled) {
+	    !driver->err_handler->mmio_enabled ||
+	    (edev->mode & EEH_DEV_NO_HANDLER)) {
 		eeh_pcid_put(dev);
 		return NULL;
 	}
@@ -254,7 +276,8 @@ static void *eeh_report_reset(void *data, void *userdata)
 	eeh_enable_irq(dev);
 
 	if (!driver->err_handler ||
-	    !driver->err_handler->slot_reset) {
+	    !driver->err_handler->slot_reset ||
+	    (edev->mode & EEH_DEV_NO_HANDLER)) {
 		eeh_pcid_put(dev);
 		return NULL;
 	}
@@ -293,7 +316,9 @@ static void *eeh_report_resume(void *data, void *userdata)
 	eeh_enable_irq(dev);
 
 	if (!driver->err_handler ||
-	    !driver->err_handler->resume) {
+	    !driver->err_handler->resume ||
+	    (edev->mode & EEH_DEV_NO_HANDLER)) {
+		edev->mode &= ~EEH_DEV_NO_HANDLER;
 		eeh_pcid_put(dev);
 		return NULL;
 	}
@@ -338,6 +363,60 @@ static void *eeh_report_failure(void *data, void *userdata)
 	return NULL;
 }
 
+static void *eeh_rmv_device(void *data, void *userdata)
+{
+	struct pci_driver *driver;
+	struct eeh_dev *edev = (struct eeh_dev *)data;
+	struct pci_dev *dev = eeh_dev_to_pci_dev(edev);
+	int *removed = (int *)userdata;
+
+	/*
+	 * Actually, we should remove the PCI bridges as well.
+	 * However, that's lots of complexity to do that,
+	 * particularly some of devices under the bridge might
+	 * support EEH. So we just care about PCI devices for
+	 * simplicity here.
+	 */
+	if (!dev || (dev->hdr_type & PCI_HEADER_TYPE_BRIDGE))
+		return NULL;
+
+	driver = eeh_pcid_get(dev);
+	if (driver) {
+		eeh_pcid_put(dev);
+		if (driver->err_handler)
+			return NULL;
+	}
+
+	/* Remove it from PCI subsystem */
+	pr_debug("EEH: Removing %s without EEH sensitive driver\n",
+		 pci_name(dev));
+	edev->bus = dev->bus;
+	edev->mode |= EEH_DEV_DISCONNECTED;
+	(*removed)++;
+
+	pci_lock_rescan_remove();
+	pci_stop_and_remove_bus_device(dev);
+	pci_unlock_rescan_remove();
+
+	return NULL;
+}
+
+static void *eeh_pe_detach_dev(void *data, void *userdata)
+{
+	struct eeh_pe *pe = (struct eeh_pe *)data;
+	struct eeh_dev *edev, *tmp;
+
+	eeh_pe_for_each_dev(pe, edev, tmp) {
+		if (!(edev->mode & EEH_DEV_DISCONNECTED))
+			continue;
+
+		edev->mode &= ~(EEH_DEV_DISCONNECTED | EEH_DEV_IRQ_DISABLED);
+		eeh_rmv_from_parent_pe(edev);
+	}
+
+	return NULL;
+}
+
 /**
  * eeh_reset_device - Perform actual reset of a pci slot
  * @pe: EEH PE
@@ -349,8 +428,9 @@ static void *eeh_report_failure(void *data, void *userdata)
  */
 static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
 {
+	struct pci_bus *frozen_bus = eeh_pe_bus_get(pe);
 	struct timeval tstamp;
-	int cnt, rc;
+	int cnt, rc, removed = 0;
 
 	/* pcibios will clear the counter; save the value */
 	cnt = pe->freeze_count;
@@ -362,8 +442,14 @@ static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
 	 * devices are expected to be attached soon when calling
 	 * into pcibios_add_pci_devices().
 	 */
-	if (bus)
-		__pcibios_remove_pci_devices(bus, 0);
+	eeh_pe_state_mark(pe, EEH_PE_KEEP);
+	if (bus) {
+		pci_lock_rescan_remove();
+		pcibios_remove_pci_devices(bus);
+		pci_unlock_rescan_remove();
+	} else if (frozen_bus) {
+		eeh_pe_dev_traverse(pe, eeh_rmv_device, &removed);
+	}
 
 	/* Reset the pci controller. (Asserts RST#; resets config space).
 	 * Reconfigure bridges and devices. Don't try to bring the system
@@ -372,6 +458,8 @@ static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
 	rc = eeh_reset_pe(pe);
 	if (rc)
 		return rc;
+
+	pci_lock_rescan_remove();
 
 	/* Restore PE */
 	eeh_ops->configure_bridge(pe);
@@ -384,20 +472,36 @@ static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
 	 * potentially weird things happen.
 	 */
 	if (bus) {
+		pr_info("EEH: Sleep 5s ahead of complete hotplug\n");
 		ssleep(5);
+
+		/*
+		 * The EEH device is still connected with its parent
+		 * PE. We should disconnect it so the binding can be
+		 * rebuilt when adding PCI devices.
+		 */
+		eeh_pe_traverse(pe, eeh_pe_detach_dev, NULL);
 		pcibios_add_pci_devices(bus);
+	} else if (frozen_bus && removed) {
+		pr_info("EEH: Sleep 5s ahead of partial hotplug\n");
+		ssleep(5);
+
+		eeh_pe_traverse(pe, eeh_pe_detach_dev, NULL);
+		pcibios_add_pci_devices(frozen_bus);
 	}
+	eeh_pe_state_clear(pe, EEH_PE_KEEP);
 
 	pe->tstamp = tstamp;
 	pe->freeze_count = cnt;
 
+	pci_unlock_rescan_remove();
 	return 0;
 }
 
 /* The longest amount of time to wait for a pci device
  * to come back on line, in seconds.
  */
-#define MAX_WAIT_FOR_RECOVERY 150
+#define MAX_WAIT_FOR_RECOVERY 300
 
 static void eeh_handle_normal_event(struct eeh_pe *pe)
 {
@@ -547,92 +651,103 @@ perm_error:
 	eeh_pe_dev_traverse(pe, eeh_report_failure, NULL);
 
 	/* Shut down the device drivers for good. */
-	if (frozen_bus)
+	if (frozen_bus) {
+		pci_lock_rescan_remove();
 		pcibios_remove_pci_devices(frozen_bus);
+		pci_unlock_rescan_remove();
+	}
 }
 
 static void eeh_handle_special_event(void)
 {
 	struct eeh_pe *pe, *phb_pe;
 	struct pci_bus *bus;
-	struct pci_controller *hose, *tmp;
+	struct pci_controller *hose;
 	unsigned long flags;
-	int rc = 0;
+	int rc;
 
-	/*
-	 * The return value from next_error() has been classified as follows.
-	 * It might be good to enumerate them. However, next_error() is only
-	 * supported by PowerNV platform for now. So it would be fine to use
-	 * integer directly:
-	 *
-	 * 4 - Dead IOC           3 - Dead PHB
-	 * 2 - Fenced PHB         1 - Frozen PE
-	 * 0 - No error found
-	 *
-	 */
-	rc = eeh_ops->next_error(&pe);
-	if (rc <= 0)
-		return;
 
-	switch (rc) {
-	case 4:
-		/* Mark all PHBs in dead state */
-		eeh_serialize_lock(&flags);
-		list_for_each_entry_safe(hose, tmp,
-				&hose_list, list_node) {
-			phb_pe = eeh_phb_pe_get(hose);
-			if (!phb_pe) continue;
+	do {
+		rc = eeh_ops->next_error(&pe);
 
-			eeh_pe_state_mark(phb_pe,
-				EEH_PE_ISOLATED | EEH_PE_PHB_DEAD);
+		switch (rc) {
+		case EEH_NEXT_ERR_DEAD_IOC:
+			/* Mark all PHBs in dead state */
+			eeh_serialize_lock(&flags);
+
+			/* Purge all events */
+			eeh_remove_event(NULL);
+
+			list_for_each_entry(hose, &hose_list, list_node) {
+				phb_pe = eeh_phb_pe_get(hose);
+				if (!phb_pe) continue;
+
+				eeh_pe_state_mark(phb_pe,
+					EEH_PE_ISOLATED | EEH_PE_PHB_DEAD);
+			}
+
+			eeh_serialize_unlock(flags);
+
+			break;
+		case EEH_NEXT_ERR_FROZEN_PE:
+		case EEH_NEXT_ERR_FENCED_PHB:
+		case EEH_NEXT_ERR_DEAD_PHB:
+			/* Mark the PE in fenced state */
+			eeh_serialize_lock(&flags);
+
+			/* Purge all events of the PHB */
+			eeh_remove_event(pe);
+
+			if (rc == EEH_NEXT_ERR_DEAD_PHB)
+				eeh_pe_state_mark(pe,
+					EEH_PE_ISOLATED | EEH_PE_PHB_DEAD);
+			else
+				eeh_pe_state_mark(pe,
+					EEH_PE_ISOLATED | EEH_PE_RECOVERING);
+
+			eeh_serialize_unlock(flags);
+
+			break;
+		case EEH_NEXT_ERR_NONE:
+			return;
+		default:
+			pr_warn("%s: Invalid value %d from next_error()\n",
+				__func__, rc);
+			return;
 		}
-		eeh_serialize_unlock(flags);
 
-		/* Purge all events */
-		eeh_remove_event(NULL);
-		break;
-	case 3:
-	case 2:
-	case 1:
-		/* Mark the PE in fenced state */
-		eeh_serialize_lock(&flags);
-		if (rc == 3)
-			eeh_pe_state_mark(pe,
-				EEH_PE_ISOLATED | EEH_PE_PHB_DEAD);
-		else
-			eeh_pe_state_mark(pe,
-				EEH_PE_ISOLATED | EEH_PE_RECOVERING);
-		eeh_serialize_unlock(flags);
+		/*
+		 * For fenced PHB and frozen PE, it's handled as normal
+		 * event. We have to remove the affected PHBs for dead
+		 * PHB and IOC
+		 */
+		if (rc == EEH_NEXT_ERR_FROZEN_PE ||
+		    rc == EEH_NEXT_ERR_FENCED_PHB) {
+			eeh_handle_normal_event(pe);
+		} else {
+			pci_lock_rescan_remove();
+			list_for_each_entry(hose, &hose_list, list_node) {
+				phb_pe = eeh_phb_pe_get(hose);
+				if (!phb_pe ||
+				    !(phb_pe->state & EEH_PE_PHB_DEAD))
+					continue;
 
-		/* Purge all events of the PHB */
-		eeh_remove_event(pe);
-		break;
-	default:
-		pr_err("%s: Invalid value %d from next_error()\n",
-		       __func__, rc);
-		return;
-	}
-
-	/*
-	 * For fenced PHB and frozen PE, it's handled as normal
-	 * event. We have to remove the affected PHBs for dead
-	 * PHB and IOC
-	 */
-	if (rc == 2 || rc == 1)
-		eeh_handle_normal_event(pe);
-	else {
-		list_for_each_entry_safe(hose, tmp,
-			&hose_list, list_node) {
-			phb_pe = eeh_phb_pe_get(hose);
-			if (!phb_pe || !(phb_pe->state & EEH_PE_PHB_DEAD))
-				continue;
-
-			bus = eeh_pe_bus_get(phb_pe);
-			/* Notify all devices that they're about to go down. */
-			eeh_pe_dev_traverse(pe, eeh_report_failure, NULL);
-			pcibios_remove_pci_devices(bus);
+				/* Notify all devices to be down */
+				bus = eeh_pe_bus_get(phb_pe);
+				eeh_pe_dev_traverse(pe,
+					eeh_report_failure, NULL);
+				pcibios_remove_pci_devices(bus);
+			}
+			pci_unlock_rescan_remove();
 		}
-	}
+
+		/*
+		 * If we have detected dead IOC, we needn't proceed
+		 * any more since all PHBs would have been removed
+		 */
+		if (rc == EEH_NEXT_ERR_DEAD_IOC)
+			break;
+	} while (rc != EEH_NEXT_ERR_NONE);
 }
 
 /**

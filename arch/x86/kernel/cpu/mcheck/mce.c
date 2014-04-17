@@ -89,6 +89,9 @@ static DECLARE_WAIT_QUEUE_HEAD(mce_chrdev_wait);
 static DEFINE_PER_CPU(struct mce, mces_seen);
 static int			cpu_missing;
 
+/* CMCI storm detection filter */
+static DEFINE_PER_CPU(unsigned long, mce_polled_error);
+
 /*
  * MCA banks polled by the period polling timer for corrected events.
  * With Intel CMCI, this only has MCA banks which do not support CMCI (if any).
@@ -96,6 +99,15 @@ static int			cpu_missing;
 DEFINE_PER_CPU(mce_banks_t, mce_poll_banks) = {
 	[0 ... BITS_TO_LONGS(MAX_NR_BANKS)-1] = ~0UL
 };
+
+/*
+ * MCA banks controlled through firmware first for corrected errors.
+ * This is a global list of banks for which we won't enable CMCI and we
+ * won't poll. Firmware controls these banks and is responsible for
+ * reporting corrected errors through GHES. Uncorrected/recoverable
+ * errors are still notified through a machine check.
+ */
+mce_banks_t mce_banks_ce_disabled;
 
 static DEFINE_PER_CPU(struct work_struct, mce_work);
 
@@ -586,6 +598,7 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 {
 	struct mce m;
 	int i;
+	unsigned long *v;
 
 	this_cpu_inc(mce_poll_count);
 
@@ -605,6 +618,8 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 		if (!(m.status & MCI_STATUS_VAL))
 			continue;
 
+		v = &get_cpu_var(mce_polled_error);
+		set_bit(0, v);
 		/*
 		 * Uncorrected or signalled events are handled by the exception
 		 * handler when it is enabled, so don't process those here.
@@ -1269,10 +1284,18 @@ static unsigned long mce_adjust_timer_default(unsigned long interval)
 static unsigned long (*mce_adjust_timer)(unsigned long interval) =
 	mce_adjust_timer_default;
 
+static int cmc_error_seen(void)
+{
+	unsigned long *v = &__get_cpu_var(mce_polled_error);
+
+	return test_and_clear_bit(0, v);
+}
+
 static void mce_timer_fn(unsigned long data)
 {
 	struct timer_list *t = &__get_cpu_var(mce_timer);
 	unsigned long iv;
+	int notify;
 
 	WARN_ON(smp_processor_id() != data);
 
@@ -1287,7 +1310,9 @@ static void mce_timer_fn(unsigned long data)
 	 * polling interval, otherwise increase the polling interval.
 	 */
 	iv = __this_cpu_read(mce_next_interval);
-	if (mce_notify_irq()) {
+	notify = mce_notify_irq();
+	notify |= cmc_error_seen();
+	if (notify) {
 		iv = max(iv / 2, (unsigned long) HZ/100);
 	} else {
 		iv = min(iv * 2, round_jiffies_relative(check_interval * HZ));
@@ -1363,7 +1388,7 @@ int mce_notify_irq(void)
 }
 EXPORT_SYMBOL_GPL(mce_notify_irq);
 
-static int __cpuinit __mcheck_cpu_mce_banks_init(void)
+static int __mcheck_cpu_mce_banks_init(void)
 {
 	int i;
 	u8 num_banks = mca_cfg.banks;
@@ -1384,7 +1409,7 @@ static int __cpuinit __mcheck_cpu_mce_banks_init(void)
 /*
  * Initialize Machine Checks for a CPU.
  */
-static int __cpuinit __mcheck_cpu_cap_init(void)
+static int __mcheck_cpu_cap_init(void)
 {
 	unsigned b;
 	u64 cap;
@@ -1483,7 +1508,7 @@ static void quirk_sandybridge_ifu(int bank, struct mce *m, struct pt_regs *regs)
 }
 
 /* Add per CPU specific workarounds here */
-static int __cpuinit __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
+static int __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
 {
 	struct mca_config *cfg = &mca_cfg;
 
@@ -1593,7 +1618,7 @@ static int __cpuinit __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
 	return 0;
 }
 
-static int __cpuinit __mcheck_cpu_ancient_init(struct cpuinfo_x86 *c)
+static int __mcheck_cpu_ancient_init(struct cpuinfo_x86 *c)
 {
 	if (c->x86 != 5)
 		return 0;
@@ -1629,15 +1654,15 @@ static void __mcheck_cpu_init_vendor(struct cpuinfo_x86 *c)
 
 static void mce_start_timer(unsigned int cpu, struct timer_list *t)
 {
-	unsigned long iv = mce_adjust_timer(check_interval * HZ);
-
-	__this_cpu_write(mce_next_interval, iv);
+	unsigned long iv = check_interval * HZ;
 
 	if (mca_cfg.ignore_ce || !iv)
 		return;
 
+	per_cpu(mce_next_interval, cpu) = iv;
+
 	t->expires = round_jiffies(jiffies + iv);
-	add_timer_on(t, smp_processor_id());
+	add_timer_on(t, cpu);
 }
 
 static void __mcheck_cpu_init_timer(void)
@@ -1664,7 +1689,7 @@ void (*machine_check_vector)(struct pt_regs *, long error_code) =
  * Called for each booted CPU to set up machine checks.
  * Must be called with preempt off:
  */
-void __cpuinit mcheck_cpu_init(struct cpuinfo_x86 *c)
+void mcheck_cpu_init(struct cpuinfo_x86 *c)
 {
 	if (mca_cfg.disabled)
 		return;
@@ -1935,6 +1960,25 @@ static struct miscdevice mce_chrdev_device = {
 	&mce_chrdev_ops,
 };
 
+static void __mce_disable_bank(void *arg)
+{
+	int bank = *((int *)arg);
+	__clear_bit(bank, __get_cpu_var(mce_poll_banks));
+	cmci_disable_bank(bank);
+}
+
+void mce_disable_bank(int bank)
+{
+	if (bank >= mca_cfg.banks) {
+		pr_warn(FW_BUG
+			"Ignoring request to disable invalid MCA bank %d.\n",
+			bank);
+		return;
+	}
+	set_bit(bank, mce_banks_ce_disabled);
+	on_each_cpu(__mce_disable_bank, &bank, 1);
+}
+
 /*
  * mce=off Disables machine check
  * mce=no_cmci Disables CMCI
@@ -2082,7 +2126,6 @@ static struct bus_type mce_subsys = {
 
 DEFINE_PER_CPU(struct device *, mce_device);
 
-__cpuinitdata
 void (*threshold_cpu_callback)(unsigned long action, unsigned int cpu);
 
 static inline struct mce_bank *attr_to_bank(struct device_attribute *attr)
@@ -2228,7 +2271,7 @@ static void mce_device_release(struct device *dev)
 }
 
 /* Per cpu device init. All of the cpus still share the same ctrl bank: */
-static __cpuinit int mce_device_create(unsigned int cpu)
+static int mce_device_create(unsigned int cpu)
 {
 	struct device *dev;
 	int err;
@@ -2245,8 +2288,10 @@ static __cpuinit int mce_device_create(unsigned int cpu)
 	dev->release = &mce_device_release;
 
 	err = device_register(dev);
-	if (err)
+	if (err) {
+		put_device(dev);
 		return err;
+	}
 
 	for (i = 0; mce_device_attrs[i]; i++) {
 		err = device_create_file(dev, mce_device_attrs[i]);
@@ -2274,7 +2319,7 @@ error:
 	return err;
 }
 
-static __cpuinit void mce_device_remove(unsigned int cpu)
+static void mce_device_remove(unsigned int cpu)
 {
 	struct device *dev = per_cpu(mce_device, cpu);
 	int i;
@@ -2294,7 +2339,7 @@ static __cpuinit void mce_device_remove(unsigned int cpu)
 }
 
 /* Make sure there are no machine checks on offlined CPUs. */
-static void __cpuinit mce_disable_cpu(void *h)
+static void mce_disable_cpu(void *h)
 {
 	unsigned long action = *(unsigned long *)h;
 	int i;
@@ -2312,7 +2357,7 @@ static void __cpuinit mce_disable_cpu(void *h)
 	}
 }
 
-static void __cpuinit mce_reenable_cpu(void *h)
+static void mce_reenable_cpu(void *h)
 {
 	unsigned long action = *(unsigned long *)h;
 	int i;
@@ -2331,7 +2376,7 @@ static void __cpuinit mce_reenable_cpu(void *h)
 }
 
 /* Get notified when a cpu comes on/off. Be hotplug friendly. */
-static int __cpuinit
+static int
 mce_cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
 {
 	unsigned int cpu = (unsigned long)hcpu;
@@ -2367,7 +2412,7 @@ mce_cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
 	return NOTIFY_OK;
 }
 
-static struct notifier_block mce_cpu_notifier __cpuinitdata = {
+static struct notifier_block mce_cpu_notifier = {
 	.notifier_call = mce_cpu_callback,
 };
 
@@ -2405,14 +2450,18 @@ static __init int mcheck_init_device(void)
 	if (err)
 		return err;
 
+	cpu_notifier_register_begin();
 	for_each_online_cpu(i) {
 		err = mce_device_create(i);
-		if (err)
+		if (err) {
+			cpu_notifier_register_done();
 			return err;
+		}
 	}
 
 	register_syscore_ops(&mce_syscore_ops);
-	register_hotcpu_notifier(&mce_cpu_notifier);
+	__register_hotcpu_notifier(&mce_cpu_notifier);
+	cpu_notifier_register_done();
 
 	/* register character device /dev/mcelog */
 	misc_register(&mce_chrdev_device);

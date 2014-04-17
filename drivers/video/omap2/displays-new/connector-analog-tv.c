@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/of.h>
 
 #include <video/omapdss.h>
 #include <video/omap-panel-data.h>
@@ -26,6 +27,26 @@ struct panel_drv_data {
 
 	enum omap_dss_venc_type connector_type;
 	bool invert_polarity;
+};
+
+static const struct omap_video_timings tvc_pal_timings = {
+	.x_res		= 720,
+	.y_res		= 574,
+	.pixelclock	= 13500000,
+	.hsw		= 64,
+	.hfp		= 12,
+	.hbp		= 68,
+	.vsw		= 5,
+	.vfp		= 5,
+	.vbp		= 41,
+
+	.interlace	= true,
+};
+
+static const struct of_device_id tvc_of_match[];
+
+struct tvc_of_data {
+	enum omap_dss_venc_type connector_type;
 };
 
 #define to_panel_data(x) container_of(x, struct panel_drv_data, dssdev)
@@ -77,8 +98,12 @@ static int tvc_enable(struct omap_dss_device *dssdev)
 
 	in->ops.atv->set_timings(in, &ddata->timings);
 
-	in->ops.atv->set_type(in, ddata->connector_type);
-	in->ops.atv->invert_vid_out_polarity(in, ddata->invert_polarity);
+	if (!ddata->dev->of_node) {
+		in->ops.atv->set_type(in, ddata->connector_type);
+
+		in->ops.atv->invert_vid_out_polarity(in,
+			ddata->invert_polarity);
+	}
 
 	r = in->ops.atv->enable(in);
 	if (r)
@@ -177,7 +202,7 @@ static int tvc_probe_pdata(struct platform_device *pdev)
 	in = omap_dss_find_output(pdata->source);
 	if (in == NULL) {
 		dev_err(&pdev->dev, "Failed to find video source\n");
-		return -ENODEV;
+		return -EPROBE_DEFER;
 	}
 
 	ddata->in = in;
@@ -187,6 +212,23 @@ static int tvc_probe_pdata(struct platform_device *pdev)
 
 	dssdev = &ddata->dssdev;
 	dssdev->name = pdata->name;
+
+	return 0;
+}
+
+static int tvc_probe_of(struct platform_device *pdev)
+{
+	struct panel_drv_data *ddata = platform_get_drvdata(pdev);
+	struct device_node *node = pdev->dev.of_node;
+	struct omap_dss_device *in;
+
+	in = omapdss_of_find_source_for_first_ep(node);
+	if (IS_ERR(in)) {
+		dev_err(&pdev->dev, "failed to find video source\n");
+		return PTR_ERR(in);
+	}
+
+	ddata->in = in;
 
 	return 0;
 }
@@ -208,18 +250,22 @@ static int tvc_probe(struct platform_device *pdev)
 		r = tvc_probe_pdata(pdev);
 		if (r)
 			return r;
+	} else if (pdev->dev.of_node) {
+		r = tvc_probe_of(pdev);
+		if (r)
+			return r;
 	} else {
 		return -ENODEV;
 	}
 
-	ddata->timings = omap_dss_pal_timings;
+	ddata->timings = tvc_pal_timings;
 
 	dssdev = &ddata->dssdev;
 	dssdev->driver = &tvc_driver;
 	dssdev->dev = &pdev->dev;
 	dssdev->type = OMAP_DISPLAY_TYPE_VENC;
 	dssdev->owner = THIS_MODULE;
-	dssdev->panel.timings = omap_dss_pal_timings;
+	dssdev->panel.timings = tvc_pal_timings;
 
 	r = omapdss_register_display(dssdev);
 	if (r) {
@@ -249,12 +295,19 @@ static int __exit tvc_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct of_device_id tvc_of_match[] = {
+	{ .compatible = "omapdss,svideo-connector", },
+	{ .compatible = "omapdss,composite-video-connector", },
+	{},
+};
+
 static struct platform_driver tvc_connector_driver = {
 	.probe	= tvc_probe,
 	.remove	= __exit_p(tvc_remove),
 	.driver	= {
 		.name	= "connector-analog-tv",
 		.owner	= THIS_MODULE,
+		.of_match_table = tvc_of_match,
 	},
 };
 

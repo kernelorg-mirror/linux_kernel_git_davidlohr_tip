@@ -132,7 +132,7 @@ static ssize_t display_timings_show(struct device *dev,
 	dssdev->driver->get_timings(dssdev, &t);
 
 	return snprintf(buf, PAGE_SIZE, "%u,%u/%u/%u/%u,%u/%u/%u/%u\n",
-			t.pixel_clock,
+			t.pixelclock,
 			t.x_res, t.hfp, t.hbp, t.hsw,
 			t.y_res, t.vfp, t.vbp, t.vsw);
 }
@@ -158,7 +158,7 @@ static ssize_t display_timings_store(struct device *dev,
 	}
 #endif
 	if (!found && sscanf(buf, "%u,%hu/%hu/%hu/%hu,%hu/%hu/%hu/%hu",
-				&t.pixel_clock,
+				&t.pixelclock,
 				&t.x_res, &t.hfp, &t.hbp, &t.hsw,
 				&t.y_res, &t.vfp, &t.vbp, &t.vsw) != 9)
 		return -EINVAL;
@@ -277,7 +277,7 @@ static ssize_t display_wss_store(struct device *dev,
 	return size;
 }
 
-static DEVICE_ATTR(name, S_IRUGO, display_name_show, NULL);
+static DEVICE_ATTR(display_name, S_IRUGO, display_name_show, NULL);
 static DEVICE_ATTR(enabled, S_IRUGO|S_IWUSR,
 		display_enabled_show, display_enabled_store);
 static DEVICE_ATTR(tear_elim, S_IRUGO|S_IWUSR,
@@ -292,7 +292,7 @@ static DEVICE_ATTR(wss, S_IRUGO|S_IWUSR,
 		display_wss_show, display_wss_store);
 
 static const struct attribute *display_sysfs_attrs[] = {
-	&dev_attr_name.attr,
+	&dev_attr_display_name.attr,
 	&dev_attr_enabled.attr,
 	&dev_attr_tear_elim.attr,
 	&dev_attr_timings.attr,

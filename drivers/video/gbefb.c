@@ -45,10 +45,6 @@ struct gbefb_par {
 #define GBE_BASE	0x16000000 /* SGI O2 */
 #endif
 
-#ifdef CONFIG_X86_VISWS
-#define GBE_BASE	0xd0000000 /* SGI Visual Workstation */
-#endif
-
 /* macro for fastest write-though access to the framebuffer */
 #ifdef CONFIG_MIPS
 #ifdef CONFIG_CPU_R10000
@@ -1236,9 +1232,9 @@ static int gbefb_probe(struct platform_device *p_dev)
 	platform_set_drvdata(p_dev, info);
 	gbefb_create_sysfs(&p_dev->dev);
 
-	printk(KERN_INFO "fb%d: %s rev %d @ 0x%08x using %dkB memory\n",
-	       info->node, info->fix.id, gbe_revision, (unsigned) GBE_BASE,
-	       gbe_mem_size >> 10);
+	fb_info(info, "%s rev %d @ 0x%08x using %dkB memory\n",
+		info->fix.id, gbe_revision, (unsigned)GBE_BASE,
+		gbe_mem_size >> 10);
 
 	return 0;
 

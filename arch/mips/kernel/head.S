@@ -158,8 +158,6 @@ NESTED(kernel_entry, 16, sp)			# kernel entry point
 	j		start_kernel
 	END(kernel_entry)
 
-	__CPUINIT
-
 #ifdef CONFIG_SMP
 /*
  * SMP slave cpus entry point.	Board specific code for bootstrap calls this
@@ -177,8 +175,8 @@ NESTED(smp_bootstrap, 16, sp)
 	DMT	10	# dmt t2 /* t0, t1 are used by CLI and setup_c0_status() */
 	jal	mips_ihb
 #endif /* CONFIG_MIPS_MT_SMTC */
-	setup_c0_status_sec
 	smp_slave_setup
+	setup_c0_status_sec
 #ifdef CONFIG_MIPS_MT_SMTC
 	andi	t2, t2, VPECONTROL_TE
 	beqz	t2, 2f
@@ -188,5 +186,3 @@ NESTED(smp_bootstrap, 16, sp)
 	j	start_secondary
 	END(smp_bootstrap)
 #endif /* CONFIG_SMP */
-
-	__FINIT
