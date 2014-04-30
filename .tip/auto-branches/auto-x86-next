@@ -196,3 +196,4 @@ x86/nuke-platforms
 x86/efi-mixed
 x86/hash
 x86/irq
+x86/espfix
