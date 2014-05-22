@@ -5,3 +5,4 @@ sched/numa
 core/rcu
 sched/mm
 sched/idle
+sched/wait
