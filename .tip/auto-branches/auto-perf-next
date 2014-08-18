@@ -21,3 +21,4 @@ perf/hw-branch-sampling
 perf/x86
 rfc/perf
 perf/kprobes
+perf/watchdog
